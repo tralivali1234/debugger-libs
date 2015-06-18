@@ -37,7 +37,8 @@ namespace Mono.Debugging.Client
 	{
 		IRawValue source;
 		EvaluationOptions options;
-		
+		DebuggerSession session;
+
 		/// <summary>
 		/// Initializes a new instance of the <see cref="Mono.Debugging.Client.RawValue"/> class.
 		/// </summary>
@@ -52,6 +53,7 @@ namespace Mono.Debugging.Client
 		void IRawObject.Connect (DebuggerSession session, EvaluationOptions options)
 		{
 			this.options = options;
+			this.session = session;
 			source = session.WrapDebuggerObject (source);
 		}
 
@@ -82,6 +84,9 @@ namespace Mono.Debugging.Client
 			RawValue val = res as RawValue;
 			if (val != null)
 				val.options = options;
+			IRawObject raw = res as IRawObject;
+			if (raw != null)
+				raw.Connect (session, options);
 			return res;
 		}
 
@@ -91,6 +96,9 @@ namespace Mono.Debugging.Client
 			RawValue val = res as RawValue;
 			if (val != null)
 				val.options = options;
+			IRawObject raw = res as IRawObject;
+			if (raw != null)
+				raw.Connect (session, options);
 			return res;
 		}
 		
