@@ -323,6 +323,7 @@ namespace Mono.Debugging.Client
 						OnRun (startInfo);
 					} catch (Exception ex) {
 						ForceExit ();
+						System.Diagnostics.Debug.WriteLine ("Unhandled exception trying to start the debugger: {0}", ex);
 						if (!HandleException (ex))
 							throw;
 					}
