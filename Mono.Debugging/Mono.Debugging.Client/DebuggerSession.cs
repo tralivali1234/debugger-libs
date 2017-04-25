@@ -328,8 +328,10 @@ namespace Mono.Debugging.Client
 					try {
 						OnRun (startInfo);
 					} catch (Exception ex) {
+						// should handle exception before raising Exit event because HandleException may ignore exceptions in Exited state
+						var exceptionHandled = HandleException (ex);
 						ForceExit ();
-						if (!HandleException (ex))
+						if (!exceptionHandled)
 							throw;
 					}
 				});
@@ -363,8 +365,10 @@ namespace Mono.Debugging.Client
 						OnAttachToProcess (proc.Id);
 						attached = true;
 					} catch (Exception ex) {
+						// should handle exception before raising Exit event because HandleException may ignore exceptions in Exited state
+						var exceptionHandled = HandleException (ex);
 						ForceExit ();
-						if (!HandleException (ex))
+						if (!exceptionHandled)
 							throw;
 					}
 				});
@@ -377,12 +381,18 @@ namespace Mono.Debugging.Client
 		public void Detach ()
 		{
 			lock (slock) {
-				try {
-					OnDetach ();
-				} catch (Exception ex) {
-					if (!HandleException (ex))
-						throw;
-				}
+				Dispatch (delegate {
+					try {
+						OnDetach ();
+					}
+					catch (Exception ex) {
+						if (!HandleException (ex))
+							throw;
+					}
+					finally {
+						IsConnected = false;
+					}
+				});
 			}
 		}
 		
@@ -509,8 +519,10 @@ namespace Mono.Debugging.Client
 					try {
 						OnFinish ();
 					} catch (Exception ex) {
+						// should handle exception before raising Exit event because HandleException may ignore exceptions in Exited state
+						var exceptionHandled = HandleException (ex);
 						ForceExit ();
-						if (!HandleException (ex))
+						if (!exceptionHandled)
 							throw;
 					}
 				});
@@ -960,7 +972,13 @@ namespace Mono.Debugging.Client
 			return result.Evaluator;
 		}
 		
-		
+		protected void RaiseStopEvent ()
+		{
+			EventHandler<TargetEventArgs> targetEvent = TargetEvent;
+			if (targetEvent != null)
+				targetEvent (this, new TargetEventArgs (TargetEventType.TargetStopped));
+		}
+
 		/// <summary>
 		/// Called when an expression needs to be resolved
 		/// </summary>
@@ -975,7 +993,11 @@ namespace Mono.Debugging.Client
 		/// </returns>
 		protected virtual string OnResolveExpression (string expression, SourceLocation location)
 		{
-			return defaultResolver.Resolve (this, location, expression);
+			var resolver = defaultResolver;
+			if (GetExpressionEvaluator != null)
+				resolver = GetExpressionEvaluator(System.IO.Path.GetExtension(location.FileName))?.Evaluator ?? defaultResolver;
+
+			return resolver.Resolve(this, location, expression);
 		}
 		
 		internal protected string ResolveIdentifierAsType (string identifier, SourceLocation location)

@@ -45,35 +45,35 @@ using Mono.Debugger.Soft;
 using Mono.Debugging.Evaluation;
 using MDB = Mono.Debugger.Soft;
 using System.Security.Cryptography;
+using System.Reflection.Metadata;
 
 namespace Mono.Debugging.Soft
 {
 	public class SoftDebuggerSession : DebuggerSession
 	{
-		class MdbSourceFileInfo
+		class SourceFileDebugInfo
 		{
 			public string FullFilePath { get; set; }
 			public int FileID { get; set; }
-			public byte[] Hash { get; set; }
-			public List<MethodMdbInfo> Methods { get; private set; }
+			public byte [] Hash { get; set; }
+			public Guid HashAlgorithem { get; set; }
+			//To avoid wasting time and memory transforming from Mdb/Pdb parser to some internal format
+			//we keep in original format
+			public readonly List<LineNumberEntry []> MdbMethods;
+			public readonly List<SequencePoint []> PdbMethods;
 
-			public MdbSourceFileInfo()
+			public SourceFileDebugInfo (List<LineNumberEntry []> methods)
 			{
-				Methods = new List<MethodMdbInfo>();
+				MdbMethods = methods;
 			}
 
-			public MdbSourceFileInfo(List<MethodMdbInfo> methods)
+			public SourceFileDebugInfo (List<SequencePoint []> methods)
 			{
-				Methods = methods;
+				PdbMethods = methods;
 			}
 		}
 
-		class MethodMdbInfo
-		{
-			public LineNumberEntry[] SequencePoints { get; set; }
-		}
-
-		readonly Dictionary<string, Dictionary<string, List<MdbSourceFileInfo>>> mdbsSourceFileInfos = new Dictionary<string, Dictionary<string, List<MdbSourceFileInfo>>>();
+		readonly Dictionary<string, Dictionary<string, List<SourceFileDebugInfo>>> sourceFilesDebugInfo = new Dictionary<string, Dictionary<string, List<SourceFileDebugInfo>>>();
 		readonly Dictionary<Tuple<TypeMirror, string>, MethodMirror[]> overloadResolveCache = new Dictionary<Tuple<TypeMirror, string>, MethodMirror[]> ();
 		readonly Dictionary<string, List<TypeMirror>> source_to_type = new Dictionary<string, List<TypeMirror>> (PathComparer);
 		readonly Dictionary<long,ObjectMirror> activeExceptionsByThread = new Dictionary<long, ObjectMirror> ();
@@ -604,7 +604,7 @@ namespace Mono.Debugging.Soft
 
 			symbolFilesTimestamps.Clear ();
 
-			mdbsSourceFileInfos.Clear ();
+			sourceFilesDebugInfo.Clear ();
 
 			if (!HasExited) {
 				if (vm != null) {
@@ -647,7 +647,7 @@ namespace Mono.Debugging.Soft
 
 		protected override void OnDetach ()
 		{
-			throw new NotSupportedException ();
+			vm.Detach ();
 		}
 
 		protected override void OnExit ()
@@ -880,6 +880,8 @@ namespace Mono.Debugging.Soft
 
 			try {
 				thread.SetIP (location);
+				StackVersion++;
+				RaiseStopEvent ();
 			} catch (ArgumentException) {
 				throw new NotSupportedException ();
 			}
@@ -1442,7 +1444,13 @@ namespace Mono.Debugging.Soft
 						req.Filter |= StepFilter.DebuggerNonUserCode;
 					if (assemblyFilters != null && assemblyFilters.Count > 0)
 						req.AssemblyFilter = assemblyFilters;
-					req.Enabled = true;
+					try {
+						req.Enabled = true;
+					}
+					catch (NotSupportedException e) {
+						if (vm.Version.AtLeast (2, 19)) //catch NotSupportedException thrown by old version of protocol
+							throw e;
+					}
 					currentStepRequest = req;
 					OnResumed ();
 					vm.Resume ();
@@ -1920,7 +1928,16 @@ namespace Mono.Debugging.Soft
 			var asm = events [0].Assembly;
 			if (events.Length > 1 && events.Any (a => a.Assembly != asm))
 				throw new InvalidOperationException ("Simultaneous AssemblyUnloadEvents for multiple assemblies");
-			
+
+			string assemblyLocation;
+			try {
+				assemblyLocation = asm.Location;
+			} catch (CommandException ex) {
+				if (ex.ErrorCode != ErrorCode.ERR_UNLOADED)
+					throw ex;
+				assemblyLocation = null;
+			}
+
 			if (assemblyFilters != null) {
 				int index = assemblyFilters.IndexOf (asm);
 				if (index != -1)
@@ -1962,10 +1979,12 @@ namespace Mono.Debugging.Soft
 				}
 			}
 
-			foreach (var pair in source_to_type) {
-				pair.Value.RemoveAll (m => PathComparer.Equals (m.Assembly.Location, asm.Location));
+			if (assemblyLocation != null) {
+				foreach (var pair in source_to_type) {
+					pair.Value.RemoveAll (m => PathComparer.Equals (m.Assembly.Location, assemblyLocation));
+				}
 			}
-			OnDebuggerOutput (false, string.Format ("Unloaded assembly: {0}\n", asm.Location));
+			OnDebuggerOutput (false, string.Format ("Unloaded assembly: {0}\n", assemblyLocation ?? "<unknown>"));
 		}
 
 		void HandleVMStartEvents (VMStartEvent[] events)
@@ -2011,7 +2030,18 @@ namespace Mono.Debugging.Soft
 		void HandleThreadDeathEvents (ThreadDeathEvent[] events)
 		{
 			current_threads = null;
-			var thread = events [0].Thread;
+			ThreadMirror thread;
+			try {
+				thread = events [0].Thread;
+			} catch (ObjectCollectedException) {
+				// A 2.1 debugger-agent can send a ThreadDeath event for a ThreadMirror
+				// already collected, in that case just allow the session to continue
+				if (!vm.Version.AtLeast (2, 2))
+					return;
+
+				// Otherwise just report the error
+				throw;
+			}
 			if (events.Length > 1 && events.Any (a => a.Thread != thread))
 				throw new InvalidOperationException ("Simultaneous ThreadDeathEvents for multiple threads");
 
@@ -2158,6 +2188,10 @@ namespace Mono.Debugging.Soft
 			if ((bp.HitAction & HitAction.CustomAction) != HitAction.None) {
 				// If custom action returns true, execution must continue
 				return binfo.RunCustomBreakpointAction (bp.CustomActionId);
+			}
+
+			if ((bp.HitAction & HitAction.PrintTrace) != HitAction.None) {
+				OnTargetDebug (0, "", "Breakpoint reached: " + binfo.FileName + ":" + binfo.Location.LineNumber + Environment.NewLine);
 			}
 
 			if ((bp.HitAction & HitAction.PrintExpression) != HitAction.None) {
@@ -2601,126 +2635,165 @@ namespace Mono.Debugging.Soft
 			return PathComparer.Compare (rp1, rp2) == 0;
 		}
 
-		bool LoadMdbFile(string mdbFileName)
+		bool LoadPdbFile (string pdbFileName)
 		{
-			if (!File.Exists (mdbFileName))
+			if (!File.Exists (pdbFileName))
 				return false;
 
-			var fileToSourceFileInfos = new Dictionary<string, List<MdbSourceFileInfo>>();
-			mdbsSourceFileInfos[mdbFileName] = fileToSourceFileInfos;
+			var fileToSourceFileInfos = new Dictionary<string, List<SourceFileDebugInfo>> ();
+			sourceFilesDebugInfo [pdbFileName] = fileToSourceFileInfos;
+			using (var fs = new FileStream (pdbFileName, FileMode.Open))
+			using (var metadataReader = MetadataReaderProvider.FromPortablePdbStream (fs)) {
+				var pdb = metadataReader.GetMetadataReader ();
+				if (pdb.Documents.Count == 0)//If .pdb has 0 documents consider it invalid
+					return false;
+				var methodMapping = new Dictionary<DocumentHandle, List<SequencePoint []>> (pdb.Documents.Count);
+				foreach (var methodHandle in pdb.MethodDebugInformation) {
+					var method = pdb.GetMethodDebugInformation (methodHandle);
+					if (method.Document.IsNil)
+						continue;
+					List<SequencePoint []> list;
+					if (!methodMapping.TryGetValue (method.Document, out list))
+						methodMapping [method.Document] = list = new List<SequencePoint []> ();
 
-			using(MonoSymbolFile mdb = MonoSymbolFile.ReadSymbolFile(mdbFileName))
-			{
-				// Create a mapping by CompileUnitIndex.
-				var methodMapping = new Dictionary<int, List<MethodMdbInfo>> (mdb.CompileUnitCount);
-				foreach (var method in mdb.Methods) {
-					List<MethodMdbInfo> list;
-					if (!methodMapping.TryGetValue(method.CompileUnitIndex, out list))
-						methodMapping[method.CompileUnitIndex] = list = new List<MethodMdbInfo> ();
-
-					list.Add (new MethodMdbInfo { SequencePoints = method.GetLineNumberTable ().LineNumbers });
+					list.Add (method.GetSequencePoints ().ToArray ());
 				}
 
-				foreach (var cu in mdb.CompileUnits)
-				{
+				foreach (var documentHandle in pdb.Documents) {
 					// A CompileUnit may not have methods, so guard against this.
-					List<MethodMdbInfo> list;
-					if (!methodMapping.TryGetValue (cu.Index, out list))
-						list = new List<MethodMdbInfo> ();
+					List<SequencePoint []> list;
+					if (!methodMapping.TryGetValue (documentHandle, out list))
+						list = new List<SequencePoint []> ();
 
-					MdbSourceFileInfo info = new MdbSourceFileInfo (list);
+					SourceFileDebugInfo info = new SourceFileDebugInfo (list);
 
-					var src = cu.SourceFile;
-					info.Hash = src.Checksum;
-					info.FileID = src.Index;
-					info.FullFilePath = src.FileName;
+					var document = pdb.GetDocument (documentHandle);
+					info.Hash = pdb.GetBlobBytes (document.Hash);
+					info.HashAlgorithem = pdb.GetGuid (document.HashAlgorithm);
+					info.FileID = 0;
+					info.FullFilePath = pdb.GetString (document.Name);
 
-					fileToSourceFileInfos [src.FileName] = new List<MdbSourceFileInfo> ();
+					fileToSourceFileInfos [info.FullFilePath] = new List<SourceFileDebugInfo> ();
 
-					if (!fileToSourceFileInfos.ContainsKey (Path.GetFileName (src.FileName)))
-						fileToSourceFileInfos [Path.GetFileName (src.FileName)] = new List<MdbSourceFileInfo> ();
+					if (!fileToSourceFileInfos.ContainsKey (Path.GetFileName (info.FullFilePath)))
+						fileToSourceFileInfos [Path.GetFileName (info.FullFilePath)] = new List<SourceFileDebugInfo> ();
 
-					fileToSourceFileInfos [src.FileName].Add (info);
-					fileToSourceFileInfos [Path.GetFileName(src.FileName)].Add (info);
+					fileToSourceFileInfos [info.FullFilePath].Add (info);
+					fileToSourceFileInfos [Path.GetFileName (info.FullFilePath)].Add (info);
 				}
 			}
 
 			return true;
 		}
 
-		void UnloadMdbFile(string mdbFileName)
+		bool LoadMdbFile (string mdbFileName)
 		{
-			if (!mdbsSourceFileInfos.ContainsKey(mdbFileName))
-				return;
+			if (!File.Exists (mdbFileName))
+				return false;
 
-			mdbsSourceFileInfos.Remove(mdbFileName);
+			var fileToSourceFileInfos = new Dictionary<string, List<SourceFileDebugInfo>> ();
+			sourceFilesDebugInfo [mdbFileName] = fileToSourceFileInfos;
+
+			using (MonoSymbolFile mdb = MonoSymbolFile.ReadSymbolFile (mdbFileName)) {
+				// Create a mapping by CompileUnitIndex.
+				var methodMapping = new Dictionary<int, List<LineNumberEntry []>> (mdb.CompileUnitCount);
+				foreach (var method in mdb.Methods) {
+					List<LineNumberEntry []> list;
+					if (!methodMapping.TryGetValue (method.CompileUnitIndex, out list))
+						methodMapping [method.CompileUnitIndex] = list = new List<LineNumberEntry []> ();
+
+					list.Add (method.GetLineNumberTable ().LineNumbers);
+				}
+
+				foreach (var cu in mdb.CompileUnits) {
+					// A CompileUnit may not have methods, so guard against this.
+					List<LineNumberEntry []> list;
+					if (!methodMapping.TryGetValue (cu.Index, out list))
+						list = new List<LineNumberEntry []> ();
+
+					SourceFileDebugInfo info = new SourceFileDebugInfo (list);
+
+					var src = cu.SourceFile;
+					info.Hash = src.Checksum;
+					info.FileID = src.Index;
+					info.FullFilePath = src.FileName;
+
+					fileToSourceFileInfos [src.FileName] = new List<SourceFileDebugInfo> ();
+
+					if (!fileToSourceFileInfos.ContainsKey (Path.GetFileName (src.FileName)))
+						fileToSourceFileInfos [Path.GetFileName (src.FileName)] = new List<SourceFileDebugInfo> ();
+
+					fileToSourceFileInfos [src.FileName].Add (info);
+					fileToSourceFileInfos [Path.GetFileName (src.FileName)].Add (info);
+				}
+			}
+
+			return true;
 		}
 
-		bool ReloadMdbFile(string mdbFilename)
+		bool LoadDebugFile (string debugFileName, Func<string,bool> loadDebugFile)
 		{
-			UnloadMdbFile (mdbFilename);
-			return LoadMdbFile (mdbFilename);
+			long debugFileTicks;
+			// Check if there is a previously saved timestamp for this debug file.
+			if (!symbolFilesTimestamps.TryGetValue (debugFileName, out debugFileTicks))
+				debugFileTicks = 0;
+
+			long currentMdbFileNameTicks = File.GetLastWriteTimeUtc (debugFileName).Ticks;
+
+			// Check if debug file has been updated and if so, reload it.
+			if (currentMdbFileNameTicks > debugFileTicks) {
+				sourceFilesDebugInfo.Remove (debugFileName);
+				if (!loadDebugFile (debugFileName))
+					return false;
+
+				symbolFilesTimestamps [debugFileName] = currentMdbFileNameTicks;
+			}
+			return true;
 		}
 
 		bool CheckBetterMatch (TypeMirror type, string file, int line, int column, Location found)
 		{
 			if (type.Assembly == null)
 				return false;
-			
+
 			string assemblyFileName;
 			if (!assemblyPathMap.TryGetValue (type.Assembly.GetName ().FullName, out assemblyFileName))
 				assemblyFileName = type.Assembly.Location;
-			
+
 			if (assemblyFileName == null)
 				return false;
-			
-			string mdbFileName = assemblyFileName + ".mdb";
-			long mdbFileNameTicks;
-
-			// Check if there is a previously saved timestamp for this .mdb file.
-			if(!symbolFilesTimestamps.TryGetValue(mdbFileName, out mdbFileNameTicks))
-				mdbFileNameTicks = 0;							
-
-			long currentMdbFileNameTicks = File.GetLastWriteTimeUtc(mdbFileName).Ticks;
-
-			// Check if .mdb file has been updated and if so, reload it.
-			if(currentMdbFileNameTicks > mdbFileNameTicks)
-			{
-				if(!ReloadMdbFile(mdbFileName))
-					return false;
-
-				symbolFilesTimestamps[mdbFileName] = currentMdbFileNameTicks;
+			string debugFile = assemblyFileName + ".mdb";
+			if (!LoadDebugFile (debugFile, LoadMdbFile)) {
+				debugFile = Path.ChangeExtension (assemblyFileName, ".pdb");
+				if (!LoadDebugFile (debugFile, LoadPdbFile)) {
+						return false;
+				}
 			}
+			Dictionary<string, List<SourceFileDebugInfo>> fileToSourceFileInfos;
 
-			Dictionary<string, List<MdbSourceFileInfo>> fileToSourceFileInfos;
+			if (!sourceFilesDebugInfo.TryGetValue (debugFile, out fileToSourceFileInfos))
+				throw new Exception ("Unable to retrieve DebugSourceFileInfo's for  '" + debugFile + "'");
 
-			if (!mdbsSourceFileInfos.TryGetValue(mdbFileName, out fileToSourceFileInfos))
-				throw new Exception("Unable to retrieve MdbSourceFileInfo's for  '" + mdbFileName + "'");
-
-			// Try to find MdbSourceFileInfo for file
-			MdbSourceFileInfo sourceInfo = null;
-			List<MdbSourceFileInfo> mdbInfos;
+			// Try to find SourceFileInfo for file
+			SourceFileDebugInfo sourceInfo = null;
+			List<SourceFileDebugInfo> sourceInfos;
 
 			// Search by full path
-			if (fileToSourceFileInfos.TryGetValue (file, out mdbInfos)) 
-			{
-				if (mdbInfos.Count != 1)
-					throw new Exception ("mdbInfos.Count is " + mdbInfos.Count + " for file: '" + file + "'");
+			if (fileToSourceFileInfos.TryGetValue (file, out sourceInfos)) {
+				if (sourceInfos.Count != 1)
+					throw new Exception ("sourceInfos.Count is " + sourceInfos.Count + " for file: '" + file + "'");
 
-				sourceInfo = mdbInfos [0];
-			}
-			else
-			{
+				sourceInfo = sourceInfos [0];
+			} else {
 				if (!File.Exists (file))
 					return false;
 
 				// Search by filename and hash
-				if (fileToSourceFileInfos.TryGetValue (Path.GetFileName (file), out mdbInfos))
-				{
+				if (fileToSourceFileInfos.TryGetValue (Path.GetFileName (file), out sourceInfos)) {
 					using (var fs = File.OpenRead (file)) {
 						using (var md5 = MD5.Create ()) {
 							var hash = md5.ComputeHash (fs);
-							foreach (var info in mdbInfos) {
+							foreach (var info in sourceInfos) {
 								if (hash.SequenceEqual (info.Hash)) {
 									sourceInfo = info;
 									break;
@@ -2731,8 +2804,7 @@ namespace Mono.Debugging.Soft
 				}
 			}
 
-			if (sourceInfo == null)
-			{
+			if (sourceInfo == null) {
 				// Search by symlink resolving
 				var resolvedFile = ResolveSymbolicLink (file);
 
@@ -2740,27 +2812,21 @@ namespace Mono.Debugging.Soft
 					return false;
 
 				// Check if we have already added the symlink in a previous lookup
-				if (fileToSourceFileInfos.TryGetValue (resolvedFile, out mdbInfos))
-				{
-					if (mdbInfos.Count != 1)
-						throw new Exception ("mdbInfos.Count is " + mdbInfos.Count + " for resolved file: '" + resolvedFile + "'");
+				if (fileToSourceFileInfos.TryGetValue (resolvedFile, out sourceInfos)) {
+					if (sourceInfos.Count != 1)
+						throw new Exception ("sourceInfos.Count is " + sourceInfos.Count + " for resolved file: '" + resolvedFile + "'");
 
-					sourceInfo = mdbInfos [0];
-				}
-				else 
-				{
-					foreach (var entry in fileToSourceFileInfos)
-					{
-						foreach (var info in entry.Value)
-						{
-							var resolvedFullFilePath = ResolveSymbolicLink(info.FullFilePath);
+					sourceInfo = sourceInfos [0];
+				} else {
+					foreach (var entry in fileToSourceFileInfos) {
+						foreach (var info in entry.Value) {
+							var resolvedFullFilePath = ResolveSymbolicLink (info.FullFilePath);
 
-							if (PathComparer.Compare(resolvedFile, resolvedFullFilePath) == 0)
-							{
+							if (PathComparer.Compare (resolvedFile, resolvedFullFilePath) == 0) {
 								sourceInfo = info;
 
 								// Add symlink so subsequent lookups are faster
-								fileToSourceFileInfos[resolvedFile] = fileToSourceFileInfos[info.FullFilePath];
+								fileToSourceFileInfos [resolvedFile] = fileToSourceFileInfos [info.FullFilePath];
 
 								break;
 							}
@@ -2774,17 +2840,34 @@ namespace Mono.Debugging.Soft
 
 			int foundDelta = found.LineNumber - line;
 
-			foreach(var methodInfo in sourceInfo.Methods)
-			{
-				foreach (var entry in methodInfo.SequencePoints) 
-				{
-					if (entry.File != sourceInfo.FileID)
-						continue;
+			if (sourceInfo.MdbMethods != null) {
+				foreach (var methodInfo in sourceInfo.MdbMethods) {
+					foreach (var entry in methodInfo) {
+						if (entry.File != sourceInfo.FileID)
+							continue;
 
-					if ((entry.Row >= line && (entry.Row - line) < foundDelta))
-						return true;
-					if (entry.Row == line && column >= entry.Column && entry.Column > found.ColumnNumber)
-						return true;
+						if ((entry.Row >= line && (entry.Row - line) < foundDelta))
+							return true;
+						if (entry.Row == line && column >= entry.Column && entry.Column > found.ColumnNumber)
+							return true;
+						if (vm.Version.AtLeast (2, 19)) { //if version is less then 2.19, found Location will not contain info about columns
+							if (entry.Row == line && column >= entry.Column && entry.Column > found.ColumnNumber)
+								return true;
+						}
+					}
+				}
+			} else if (sourceInfo.PdbMethods != null) {
+				foreach (var methodInfo in sourceInfo.PdbMethods) {
+					foreach (var entry in methodInfo) {
+						if ((entry.StartLine >= line && (entry.StartLine - line) < foundDelta))
+							return true;
+						if (entry.StartLine == line && column >= entry.StartColumn && entry.StartColumn > found.ColumnNumber)
+							return true;
+						if (vm.Version.AtLeast (2, 19)) { //if version is less then 2.19, found Location will not contain info about columns
+							if (entry.StartLine == line && column >= entry.StartColumn && entry.StartColumn > found.ColumnNumber)
+								return true;
+						}
+					}
 				}
 			}
 
@@ -3218,6 +3301,8 @@ namespace Mono.Debugging.Soft
 			string oper;
 			if (ins.Operand is MethodMirror)
 				oper = ((MethodMirror)ins.Operand).FullName;
+			else if (ins.Operand is FieldInfoMirror)
+				oper = ((FieldInfoMirror)ins.Operand).FullName;
 			else if (ins.Operand is TypeMirror)
 				oper = ((TypeMirror)ins.Operand).FullName;
 			else if (ins.Operand is ILInstruction)
